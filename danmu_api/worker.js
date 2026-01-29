@@ -4,9 +4,17 @@ import { log, formatLogMessage } from './utils/log-util.js'
 import { getRedisCaches, judgeRedisValid } from "./utils/redis-util.js";
 import { cleanupExpiredIPs, findUrlById, getCommentCache, getLocalCaches, judgeLocalCacheValid } from "./utils/cache-util.js";
 import { formatDanmuResponse } from "./utils/danmu-util.js";
-import { getBangumi, getComment, getCommentByUrl, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
+import { getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
 import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache } from "./apis/system-api.js";
 import { handleSetEnv, handleAddEnv, handleDelEnv } from "./apis/env-api.js";
+import { Segment } from "./models/dandan-model.js"
+import {
+    handleCookieStatus,
+    handleCookieVerify,
+    handleQRGenerate,
+    handleQRCheck,
+    handleCookieSave
+} from "./utils/cookie-util.js";
 
 let globals;
 
@@ -114,7 +122,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
 
   // 智能处理API路径前缀，确保最终有一个正确的 /api/v2
   if (path !== "/" && path !== "/api/logs" && !path.startsWith('/api/env') 
-    && !path.startsWith('/api/deploy') && !path.startsWith('/api/cache')) {
+    && !path.startsWith('/api/deploy') && !path.startsWith('/api/cache')
+    && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')) {
       log("info", `[Path Check] Starting path normalization for: "${path}"`);
       const pathBeforeCleanup = path; // 保存清理前的路径检查是否修改
       
@@ -135,7 +144,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       // 2. 补全：如果路径缺少前缀（例如请求原始路径为 /search/anime），则补全
       const pathBeforePrefixCheck = path;
       if (!path.startsWith('/api/v2') && path !== '/' && !path.startsWith('/api/logs') 
-        && !path.startsWith('/api/env') && !path.startsWith('/api/env') && !path.startsWith('/api/cache')) {
+        && !path.startsWith('/api/env') && !path.startsWith('/api/cache')
+        && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')) {
           log("info", `[Path Check] Path is missing /api/v2 prefix. Adding...`);
           path = '/api/v2' + path;
       }
@@ -177,6 +187,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   if (path.startsWith("/api/v2/comment") && method === "GET") {
     const queryFormat = url.searchParams.get('format');
     const videoUrl = url.searchParams.get('url');
+    const segmentFlagParam = url.searchParams.get('segmentflag');
+    const segmentFlag = segmentFlagParam === 'true' || segmentFlagParam === '1';
 
     // ⚠️ 限流设计说明：
     // 1. 先检查缓存，缓存命中时直接返回，不计入限流次数
@@ -225,7 +237,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       }
 
       // 通过URL获取弹幕
-      return getCommentByUrl(videoUrl, queryFormat);
+      return getCommentByUrl(videoUrl, queryFormat, segmentFlag);
     }
 
     // 否则通过commentId获取弹幕
@@ -285,7 +297,37 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       log("info", `[Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
     }
 
-    return getComment(path, queryFormat);
+    return getComment(path, queryFormat, segmentFlag);
+  }
+
+  // POST /api/v2/segmentcomment - 接收segment类的JSON请求体
+ if (path.startsWith("/api/v2/segmentcomment") && method === "POST") {
+    try {
+      const queryFormat = url.searchParams.get('format');
+      // 从请求体获取segment数据
+      const requestBody = await req.json();
+      let segment;
+      
+      // 尝试解析JSON
+      try {
+        segment = Segment.fromJson(requestBody);
+      } catch (e) {
+        log("error", "Invalid JSON in request body for segment");
+        return jsonResponse(
+          { errorCode: 400, success: false, errorMessage: "Invalid JSON in request body" },
+          400
+        );
+      }
+
+      // 通过URL和平台获取分段弹幕
+      return getSegmentComment(segment, queryFormat);
+    } catch (error) {
+      log("error", `Error processing segmentcomment request: ${error.message}`);
+      return jsonResponse(
+        { errorCode: 500, success: false, errorMessage: "Internal server error" },
+        500
+      );
+    }
   }
 
   // GET /api/logs
@@ -321,6 +363,33 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   // POST /api/cache/clear - 清理缓存
   if (path === "/api/cache/clear" && method === "POST") {
     return handleClearCache();
+  }
+
+  // ========== Cookie 管理 API ==========
+  
+  // GET /api/cookie/status - 获取Cookie状态
+  if (path === "/api/cookie/status" && method === "GET") {
+    return handleCookieStatus();
+  }
+
+  // POST /api/cookie/qr/generate - 生成登录二维码
+  if (path === "/api/cookie/qr/generate" && method === "POST") {
+    return handleQRGenerate();
+  }
+
+  // POST /api/cookie/qr/check - 检查二维码扫描状态
+  if (path === "/api/cookie/qr/check" && method === "POST") {
+    return handleQRCheck(req);
+  }
+
+  // POST /api/cookie/verify - 校验指定Cookie（用于前端实时检测）
+  if (path === "/api/cookie/verify" && method === "POST") {
+    return handleCookieVerify(req);
+  }
+
+  // POST /api/cookie/save - 保存Cookie
+  if (path === "/api/cookie/save" && method === "POST") {
+    return handleCookieSave(req);
   }
 
   return jsonResponse({ message: "Not found" }, 404);
