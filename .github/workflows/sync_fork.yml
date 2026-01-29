@@ -1,44 +1,61 @@
 name: Fork Sync
 
 permissions:
-    contents: write
+  contents: write
 
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "0 0 * * *" # 每天 00:00 UTC 执行（GitHub Actions schedule 使用 UTC）
+  workflow_dispatch: # 允许手动触发
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync_with_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v4
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+      - name: Sync upstream (exclude workflows)
+        env:
+          UPSTREAM_REPO: huangxd-/danmu_api
+          UPSTREAM_BRANCH: main
+          TARGET_BRANCH: main
+        run: |
+          set -euo pipefail
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+          git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune upstream
+
+          git checkout "${TARGET_BRANCH}"
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          echo "local=${LOCAL_SHA}"
+          echo "upstream=${UPSTREAM_SHA}"
+
+          if [ "${LOCAL_SHA}" = "${UPSTREAM_SHA}" ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          # 合并上游但不提交；随后把 .github/workflows 还原成 fork 自己的版本，避免推送 workflow 文件变更被 GitHub 拒绝。
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+          git checkout HEAD -- .github/workflows
+
+          if [ -z "$(git status --porcelain=v1)" ]; then
+            echo "No effective changes after excluding workflows. Aborting merge."
+            git merge --abort || true
+            exit 0
+          fi
+
+          git commit -m "chore: sync upstream (exclude workflows)"
+          git push origin "${TARGET_BRANCH}"
