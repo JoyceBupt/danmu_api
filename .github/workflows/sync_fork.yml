@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Sync upstream (exclude workflows)
+      - name: Sync upstream snapshot (exclude workflows)
         env:
           UPSTREAM_REPO: huangxd-/danmu_api
           UPSTREAM_BRANCH: main
@@ -33,7 +33,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch --prune upstream
+          git fetch --prune upstream "${UPSTREAM_BRANCH}"
 
           git checkout "${TARGET_BRANCH}"
 
@@ -47,15 +47,42 @@ jobs:
             exit 0
           fi
 
-          # 合并上游但不提交；随后把 .github/workflows 还原成 fork 自己的版本，避免推送 workflow 文件变更被 GitHub 拒绝。
-          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
-          git checkout HEAD -- .github/workflows
+          # 只应用上游自共同祖先以来的非 workflow 变更，避免把上游 workflow 历史推回 fork。
+          BASE_SHA="$(git merge-base HEAD "upstream/${UPSTREAM_BRANCH}")"
+          if [ -z "${BASE_SHA}" ]; then
+            echo "Failed to determine merge base with upstream."
+            exit 1
+          fi
 
-          if [ -z "$(git status --porcelain=v1)" ]; then
-            echo "No effective changes after excluding workflows. Aborting merge."
-            git merge --abort || true
+          mapfile -d '' RESTORE_PATHS < <(
+            git diff --name-only -z --diff-filter=ACMRT \
+              "${BASE_SHA}" "upstream/${UPSTREAM_BRANCH}" -- \
+              . ':(exclude).github/workflows'
+          )
+
+          mapfile -d '' DELETE_PATHS < <(
+            git diff --name-only -z --diff-filter=D \
+              "${BASE_SHA}" "upstream/${UPSTREAM_BRANCH}" -- \
+              . ':(exclude).github/workflows'
+          )
+
+          if [ "${#RESTORE_PATHS[@]}" -eq 0 ] && [ "${#DELETE_PATHS[@]}" -eq 0 ]; then
+            echo "No effective changes after excluding workflows."
             exit 0
           fi
 
-          git commit -m "chore: sync upstream (exclude workflows)"
+          if [ "${#RESTORE_PATHS[@]}" -gt 0 ]; then
+            git restore --source="upstream/${UPSTREAM_BRANCH}" --staged --worktree -- "${RESTORE_PATHS[@]}"
+          fi
+
+          if [ "${#DELETE_PATHS[@]}" -gt 0 ]; then
+            git rm -f --ignore-unmatch -- "${DELETE_PATHS[@]}"
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No effective changes after excluding workflows."
+            exit 0
+          fi
+
+          git commit -m "chore: sync upstream snapshot (exclude workflows)"
           git push origin "${TARGET_BRANCH}"
